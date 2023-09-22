@@ -13,17 +13,21 @@ const client = new Client({
 });
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const SOUNDCLOUD_CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
 const guildQueues = new Map();
 
-async function getSoundCloudURL(trackURL) {
+async function searchYoutube(query) {
+    const { data } = await axios.get(`https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`);
+    if (!data.items.length) return null;
+    return `https://www.youtube.com/watch?v=${data.items[0].id.videoId}`;
+}
+
+async function fetchRelatedVideos(videoId) {
     try {
-        const resolveURL = `https://api.soundcloud.com/resolve?url=${trackURL}&client_id=${SOUNDCLOUD_CLIENT_ID}`;
-        const response = await axios.get(resolveURL);
-        const trackID = response.data.id;
-        return `https://api.soundcloud.com/tracks/${trackID}/stream?client_id=${SOUNDCLOUD_CLIENT_ID}`;
+        const { data } = await axios.get(`https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&relatedToVideoId=${videoId}&type=video&key=${YOUTUBE_API_KEY}`);
+        if (!data.items.length) return null;
+        return `https://www.youtube.com/watch?v=${data.items[0].id.videoId}`;
     } catch (error) {
-        console.error("Error fetching SoundCloud track:", error);
+        console.error("Error fetching related videos:", error);
         return null;
     }
 }
@@ -51,16 +55,28 @@ class GuildQueue {
 
     enqueue(streamURL) {
         this.queue.push(streamURL);
-        if (this.queue.length === 1) {  // If it's the only song in the queue
+        if (this.queue.length === 1) {
             this.playNext();
         }
     }
 
     playNext() {
         if (!this.queue.length) {
-            this.connection.destroy();
+            const currentTrack = this.currentTrack();
+            if (currentTrack) {  // Check if currentTrack exists
+                const currentVideoId = new URL(currentTrack).searchParams.get("v");
+                fetchRelatedVideos(currentVideoId).then(relatedVideoURL => {
+                    if (relatedVideoURL) {
+                        this.enqueue(relatedVideoURL);
+                        this.playNext();
+                    }
+                }).catch(error => {
+                    console.error("Error fetching the next recommended song:", error);
+                });
+            }
             return;
         }
+        
         const nextTrack = this.queue[0];
         const resource = createAudioResource(ytdl(nextTrack, { filter: 'audioonly', quality: 'highestaudio' }));
         this.player.play(resource);
@@ -86,9 +102,25 @@ class GuildQueue {
     skip() {
         this.queue.shift();
         this.playNext();
+        if (!this.queue.length) { // If the queue is empty
+            const currentTrack = this.currentTrack();
+            if (currentTrack) {  // Check if currentTrack exists
+                const currentVideoId = new URL(currentTrack).searchParams.get("v");
+                fetchRelatedVideos(currentVideoId).then(relatedVideoURL => {
+                    if (relatedVideoURL) {
+                        this.enqueue(relatedVideoURL);
+                        this.playNext();
+                    }
+                }).catch(error => {
+                    console.error("Error fetching the next recommended song:", error);
+                });
+            }
+            return;
+        }
+        this.queue.shift();
+        this.playNext();
     }
-}
-
+    }
 
 client.once('ready', async () => {
     console.log('Logged in as ' + client.user.tag);
@@ -121,44 +153,54 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isCommand()) return;
+    try {
+        if (!interaction.isCommand()) return;
 
-    const { commandName } = interaction;
-    const guild = interaction.guild;
-    if (!guild) return;
+        // Defer the reply to the interaction
+        await interaction.deferReply();
 
-    let queue = guildQueues.get(guild.id);
+        const { commandName } = interaction;
+        const guild = interaction.guild;
+        if (!guild) return;
 
-    switch (commandName) {
-        case 'play':
-            const url = interaction.options.getString('url');
-            let streamURL;
-            if (url.includes('youtube.com')) {
-                if (!ytdl.validateURL(url)) {
-                    return await interaction.reply('Invalid YouTube URL.');
+        let queue = guildQueues.get(guild.id);
+
+        switch (commandName) {
+            case 'play':
+                const query = interaction.options.getString('url');
+                let streamURL;
+                if (!query.startsWith('http')) {
+                    streamURL = await searchYoutube(query);
+                    if (!streamURL) {
+                        return await interaction.editReply('No results found.');
+                    }
+                } else {
+                    if (query.includes('youtube.com')) {
+                        if (!ytdl.validateURL(query)) {
+                            return await interaction.editReply('Invalid YouTube URL.');
+                        }
+                        streamURL = query;
+                    } else if (query.includes('soundcloud.com')) {
+                        // Implement your SoundCloud fetching logic here
+                        return await interaction.editReply('SoundCloud support is not yet implemented.');
+                    } else {
+                        return await interaction.editReply('Unsupported URL. Please provide a YouTube or SoundCloud link.');
+                    }
                 }
-                streamURL = url;
-            } else if (url.includes('soundcloud.com')) {
-                streamURL = await getSoundCloudURL(url);
-                if (!streamURL) {
-                    return await interaction.reply('Error fetching the SoundCloud track.');
-                }
-            } else {
-                return await interaction.reply('Unsupported URL. Please provide a YouTube or SoundCloud link.');
-            }
 
-            if (!queue) {
-                const channel = interaction.member.voice.channel;
-                if (!channel) {
-                    return await interaction.reply('You need to be in a voice channel first.');
+                if (!queue) {
+                    const channel = interaction.member.voice.channel;
+                    if (!channel) {
+                        return await interaction.editReply('You need to be in a voice channel first.');
+                    }
+                    queue = new GuildQueue(channel);
+                    guildQueues.set(guild.id, queue);
                 }
-                queue = new GuildQueue(channel);
-                guildQueues.set(guild.id, queue);
-            }
 
-            queue.enqueue(streamURL);
-            await interaction.reply('Added to queue!');
-            break;
+                queue.enqueue(streamURL);
+                await interaction.editReply('Added to queue!');
+                break;
+        
         case 'pause':
             if (queue) {
                 queue.pause();
@@ -175,14 +217,15 @@ client.on('interactionCreate', async interaction => {
                 await interaction.reply('No song is currently paused.');
             }
             break;
-        case 'skip':
-            if (queue) {
-                queue.skip();
-                await interaction.reply('Skipped the song!');
-            } else {
-                await interaction.reply('No song is currently playing.');
-            }
-            break;
+        
+            case 'skip':
+                if (queue) {
+                    queue.skip();
+                    await interaction.editReply('Skipped to the next song!');
+                } else {
+                    await interaction.editReply('No song is currently playing, so nothing to skip.');
+                }
+                break;
         case 'current':
             if (queue && queue.currentTrack()) {
                 await interaction.reply(`Now playing: ${queue.currentTrack()}`);
@@ -202,6 +245,10 @@ client.on('interactionCreate', async interaction => {
                 await interaction.reply('No songs in the queue.');
             }
             break;
+        }
+
+    } catch (error) {
+        console.error("There was an error:", error);
     }
 });
 
