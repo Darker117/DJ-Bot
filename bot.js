@@ -21,10 +21,33 @@ async function searchYoutube(query) {
     return `https://www.youtube.com/watch?v=${data.items[0].id.videoId}`;
 }
 
+const fetchCooldowns = new Set();
+
+function isOnCooldown(guildId) {
+    return fetchCooldowns.has(guildId);
+}
+
+function setCooldown(guildId) {
+    fetchCooldowns.add(guildId);
+    setTimeout(() => {
+        fetchCooldowns.delete(guildId);
+    }, 10);  // 10 seconds cooldown (adjust as necessary)
+}
+
 async function fetchRelatedVideos(videoId) {
     try {
+        // Check cooldown here
+        if (isOnCooldown(videoId)) {
+            console.log('On cooldown for fetching related videos.');
+            return null;
+        }
+
         const { data } = await axios.get(`https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&relatedToVideoId=${videoId}&type=video&key=${YOUTUBE_API_KEY}`);
         if (!data.items.length) return null;
+        
+        // Set the cooldown after making a successful request
+        setCooldown(videoId);
+        
         return `https://www.youtube.com/watch?v=${data.items[0].id.videoId}`;
     } catch (error) {
         console.error("Error fetching related videos:", error);
@@ -54,8 +77,15 @@ class GuildQueue {
     }
 
     enqueue(streamURL) {
+        if (!streamURL) {
+            console.error('Stream URL is undefined');
+            return;
+        }
+        
         this.queue.push(streamURL);
-        if (this.queue.length === 1) {
+
+        // If the song isn't currently playing, start playing.
+        if (this.player.state.status === AudioPlayerStatus.Idle) {
             this.playNext();
         }
     }
@@ -100,8 +130,7 @@ class GuildQueue {
     }
 
     skip() {
-        this.queue.shift();
-        this.playNext();
+        
         if (!this.queue.length) { // If the queue is empty
             const currentTrack = this.currentTrack();
             if (currentTrack) {  // Check if currentTrack exists
@@ -154,11 +183,10 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     try {
-        if (!interaction.isCommand()) return;
-
-        // Defer the reply to the interaction
-        await interaction.deferReply();
-
+        await interaction.deferReply().catch(error => {
+            console.error("Error deferring reply:", error);
+            throw new Error("Failed to defer reply"); // Stop execution if deferring fails
+        });
         const { commandName } = interaction;
         const guild = interaction.guild;
         if (!guild) return;
@@ -167,6 +195,9 @@ client.on('interactionCreate', async interaction => {
 
         switch (commandName) {
             case 'play':
+                if (isOnCooldown(guild.id)) {
+                    return await interaction.editReply('Wait a bit before searching for another song.');
+                }
                 const query = interaction.options.getString('url');
                 let streamURL;
                 if (!query.startsWith('http')) {
@@ -204,17 +235,17 @@ client.on('interactionCreate', async interaction => {
         case 'pause':
             if (queue) {
                 queue.pause();
-                await interaction.reply('Paused the song!');
+                await interaction.editReply('Paused the song!');
             } else {
-                await interaction.reply('No song is currently playing.');
+                await interaction.editReply('No song is currently playing.');
             }
             break;
         case 'resume':
             if (queue) {
                 queue.resume();
-                await interaction.reply('Resumed the song!');
+                await interaction.eidtReply('Resumed the song!');
             } else {
-                await interaction.reply('No song is currently paused.');
+                await interaction.editReply('No song is currently paused.');
             }
             break;
         
@@ -228,27 +259,33 @@ client.on('interactionCreate', async interaction => {
                 break;
         case 'current':
             if (queue && queue.currentTrack()) {
-                await interaction.reply(`Now playing: ${queue.currentTrack()}`);
+                await interaction.editReply(`Now playing: ${queue.currentTrack()}`);
             } else {
-                await interaction.reply('No song is currently playing.');
+                await interaction.editReply('No song is currently playing.');
             }
             break;
         case 'queue':
             if (queue) {
                 const upcoming = queue.upcomingTracks();
                 if (upcoming.length) {
-                    await interaction.reply(`Next songs:\n${upcoming.join('\n')}`);
+                    await interaction.editReply(`Next songs:\n${upcoming.join('\n')}`);
                 } else {
-                    await interaction.reply('No more songs in the queue.');
+                    await interaction.editReply('No more songs in the queue.');
                 }
             } else {
-                await interaction.reply('No songs in the queue.');
+                await interaction.editReply('No songs in the queue.');
             }
             break;
         }
 
     } catch (error) {
         console.error("There was an error:", error);
+        // Respond to the interaction with an error message if possible
+        try {
+            await interaction.followUp({ content: 'An error occurred while processing your command.' });
+        } catch (followUpError) {
+            console.error("Failed to send follow-up:", followUpError);
+        }
     }
 });
 
